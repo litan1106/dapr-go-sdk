@@ -27,7 +27,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to process event: %v", err)
 	}
-	log.Printf("processing event: %s", event.Type)
+	log.Printf("processing event: %s", event.Type) //nolint:gosec // event.Type is the GitHub Actions event name from GITHUB_EVENT_NAME
 
 	res, err := bot.HandleEvent(ctx, event)
 	if err != nil {
