@@ -19,7 +19,7 @@ func main() {
 	bot := NewBot(ghClient)
 	eventType := os.Getenv("GITHUB_EVENT_NAME")
 	eventPath := os.Getenv("GITHUB_EVENT_PATH")
-	data, err := os.ReadFile(eventPath)
+	data, err := os.ReadFile(eventPath) //nolint:gosec // eventPath is provided by the GitHub Actions runner
 	if err != nil {
 		log.Fatalf("failed to read event: %v", err)
 	}
@@ -33,5 +33,5 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to handle event: %v", err)
 	}
-	log.Println(res)
+	log.Println(res) //nolint:gosec // res is a bot-generated status string, not user-controlled
 }
