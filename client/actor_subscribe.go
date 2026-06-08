@@ -580,7 +580,13 @@ func withActorCallbackMetadata(ctx context.Context, md map[string]string) contex
 	if len(md) == 0 {
 		return ctx
 	}
-	return context.WithValue(ctx, actorCallbackMetadataCtxKey{}, md)
+	// Copy so the value carried on the context is independent of the protobuf
+	// request's map and cannot be mutated through it.
+	cp := make(map[string]string, len(md))
+	for k, v := range md {
+		cp[k] = v
+	}
+	return context.WithValue(ctx, actorCallbackMetadataCtxKey{}, cp)
 }
 
 // reentrancyIDFromContext returns the reentrancy id of the actor callback in

@@ -68,9 +68,13 @@ func (c *GRPCClient) InvokeActor(ctx context.Context, in *InvokeActorRequest) (o
 
 	// Propagate the reentrancy id when invoking from within an actor callback
 	// received over the actor event stream, so reentrant calls share the
-	// caller's reentrancy stack.
+	// caller's reentrancy stack. Only the reentrancy key is set, preserving any
+	// other metadata already on the request.
 	if id, ok := reentrancyIDFromContext(ctx); ok {
-		req.Metadata = map[string]string{reentrancyIDMetadataKey: id}
+		if req.Metadata == nil {
+			req.Metadata = make(map[string]string)
+		}
+		req.Metadata[reentrancyIDMetadataKey] = id
 	}
 
 	resp, err := c.protoClient.InvokeActor(ctx, req)

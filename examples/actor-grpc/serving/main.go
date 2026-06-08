@@ -33,13 +33,14 @@ import (
 
 var logger = log.New(os.Stdout, "", log.LstdFlags)
 
-func testActorFactory() actor.ServerContext {
-	client, err := dapr.NewClient()
-	if err != nil {
-		panic(err)
-	}
-	return &TestActor{
-		daprClient: client,
+// testActorFactory returns a factory that shares a single Dapr client across
+// all actor instances instead of opening (and leaking) a new connection per
+// activation.
+func testActorFactory(client dapr.Client) actor.FactoryContext {
+	return func() actor.ServerContext {
+		return &TestActor{
+			daprClient: client,
+		}
 	}
 }
 
@@ -152,6 +153,7 @@ func main() {
 			logger.Fatalf("error listening: %v", err)
 		}
 	}()
+	defer s.GracefulStop() //nolint:errcheck
 
 	client, err := dapr.NewClient()
 	if err != nil {
@@ -160,9 +162,9 @@ func main() {
 	defer client.Close()
 
 	// Register the hosted actor types on the actor runtime, exactly as when
-	// hosting actors over HTTP.
+	// hosting actors over HTTP. The actors share the client created above.
 	rt := runtime.GetActorRuntimeInstanceContext()
-	rt.RegisterActorFactory(testActorFactory)
+	rt.RegisterActorFactory(testActorFactory(client))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -184,6 +186,9 @@ func main() {
 }
 
 func subscribeWithRetry(ctx context.Context, client dapr.Client, rt *runtime.ActorRunTimeContext) (func() error, error) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
 	var err error
 	for i := 0; i < 30; i++ {
 		var stop func() error
@@ -198,7 +203,7 @@ func subscribeWithRetry(ctx context.Context, client dapr.Client, rt *runtime.Act
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(time.Second):
+		case <-ticker.C:
 		}
 	}
 	return nil, err
