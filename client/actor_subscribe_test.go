@@ -638,12 +638,20 @@ func Test_anyToRawData(t *testing.T) {
 		assert.Equal(t, []byte(`"hello"`), anyToRawData(data))
 	})
 
-	t.Run("unknown type falls back to raw value", func(t *testing.T) {
+	t.Run("unknown type falls back to a valid JSON string", func(t *testing.T) {
 		data := &anypb.Any{
 			TypeUrl: "type.googleapis.com/unknown.Type",
 			Value:   []byte("raw"),
 		}
-		assert.Equal(t, []byte("raw"), anyToRawData(data))
+		got := anyToRawData(data)
+
+		// The fallback must be valid JSON (it is embedded as json.RawMessage in
+		// the reminder/timer params) and must round-trip back to the raw bytes,
+		// matching how api.ActorReminderParams.Data ([]byte) decodes it.
+		assert.True(t, json.Valid(got), "fallback must be valid JSON: %s", got)
+		var decoded []byte
+		require.NoError(t, json.Unmarshal(got, &decoded))
+		assert.Equal(t, []byte("raw"), decoded)
 	})
 }
 

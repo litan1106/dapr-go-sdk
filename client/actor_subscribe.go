@@ -108,7 +108,11 @@ type ActorEventSubscriptionOptions struct {
 // SubscribeActorEventsAlpha1 stream, dispatching callbacks pushed by the
 // sidecar to the ActorEventHandler and sending the correlated responses back.
 type actorEventSubscription struct {
-	ctx     context.Context
+	// ctx is an internal context derived from the caller's; cancel tears it
+	// down so a Recv blocked in run() unblocks promptly on Close.
+	ctx    context.Context
+	cancel context.CancelFunc
+
 	handler ActorEventHandler
 
 	// lock locks concurrent writes to the subscription stream.
@@ -145,13 +149,19 @@ func (c *GRPCClient) SubscribeActorEvents(ctx context.Context, handler ActorEven
 		return c.subscribeActorEventsInitialRequest(ctx, handler.RegisteredActorTypes(), opts)
 	}
 
-	stream, err := createStream(ctx)
+	// Derive an internal context so Close can cancel the stream (and any
+	// in-flight Recv) without depending on the caller cancelling ctx.
+	streamCtx, cancel := context.WithCancel(ctx)
+
+	stream, err := createStream(streamCtx)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 
 	s := &actorEventSubscription{
-		ctx:          ctx,
+		ctx:          streamCtx,
+		cancel:       cancel,
 		handler:      handler,
 		stream:       stream,
 		createStream: createStream,
@@ -240,13 +250,18 @@ func (s *actorEventSubscription) Close() error {
 		return errors.New("actor event subscription already closed")
 	}
 
+	// Half-close the send side first, then cancel the stream context so a Recv
+	// blocked in run() unblocks promptly instead of waiting for the server to
+	// react to the half-close.
 	s.lock.Lock()
-	defer s.lock.Unlock()
-
+	var err error
 	if s.stream != nil {
-		return s.stream.CloseSend()
+		err = s.stream.CloseSend()
 	}
-	return nil
+	s.lock.Unlock()
+
+	s.cancel()
+	return err
 }
 
 // run reads callbacks from the stream and dispatches each on its own
@@ -559,17 +574,26 @@ func anyToRawData(data *anypb.Any) []byte {
 	}
 	msg, err := data.UnmarshalNew()
 	if err != nil {
-		// Unknown or unregistered payload type: fall back to the raw value.
-		return data.GetValue()
+		// Unknown or unregistered payload type: encode the raw bytes as a JSON
+		// string so the value stays valid JSON when embedded under params
+		// "data". The actor runtime base64-decodes it back to these bytes.
+		return rawBytesToJSON(data.GetValue())
 	}
 	if b, ok := msg.(*wrapperspb.BytesValue); ok {
 		return b.GetValue()
 	}
 	d, err := protojson.Marshal(msg)
 	if err != nil {
-		return data.GetValue()
+		return rawBytesToJSON(data.GetValue())
 	}
 	return d
+}
+
+// rawBytesToJSON encodes opaque bytes as a JSON string (base64) so they can be
+// embedded as a valid JSON value. json.Marshal of a []byte never errors.
+func rawBytesToJSON(b []byte) []byte {
+	out, _ := json.Marshal(b)
+	return out
 }
 
 // actorCallbackMetadataCtxKey carries the metadata of the actor callback
