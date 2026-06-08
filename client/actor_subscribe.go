@@ -539,9 +539,20 @@ func actorErrMessage(aerr actorErr.ActorErr) string {
 }
 
 // anyToRawData unwraps the reminder/timer payload the sidecar sends as a
-// google.protobuf.Any. Payloads registered as raw bytes (the common case)
-// arrive as a wrapped BytesValue; typed payloads are rendered as JSON. This
-// mirrors how the sidecar serializes reminder data for the HTTP callbacks.
+// google.protobuf.Any into the JSON value to embed under the params "data"
+// field. The returned bytes are a JSON value, NOT raw bytes, so the caller
+// must embed them as json.RawMessage; marshalling them as []byte would
+// base64-encode them a second time and the actor runtime would decode the
+// wrong bytes.
+//
+// Payloads registered via the actor reminder/timer APIs arrive as a
+// BytesValue whose contents are already json.Marshal(registered) — i.e. a
+// base64-encoded JSON string — because the sidecar marshals the bytes before
+// wrapping them (see RegisterActorReminder/RegisterActorTimer in daprd's
+// pkg/api/universal/actors.go). api.ActorReminderParams.Data ([]byte) then
+// base64-decodes that string back to the registered bytes. Typed payloads are
+// rendered as JSON via protojson. This mirrors how the sidecar serializes
+// reminder/timer data for the HTTP callbacks.
 func anyToRawData(data *anypb.Any) []byte {
 	if data == nil {
 		return nil
