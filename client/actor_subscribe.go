@@ -44,11 +44,6 @@ const (
 	// invoke callbacks and responses.
 	contentTypeMetadataKey = "content-type"
 
-	// actorEventsContentType is the content type of actor method responses.
-	// Actor payloads are serialized with the actor runtime codec, which is
-	// JSON by default.
-	actorEventsContentType = "application/json"
-
 	actorEventsReconnectInitialBackoff = 200 * time.Millisecond
 	actorEventsReconnectMaxBackoff     = 5 * time.Second
 )
@@ -336,15 +331,37 @@ func (s *actorEventSubscription) handleInvoke(req *pb.SubscribeActorEventsRespon
 		return
 	}
 
+	// Echo the caller's content-type back on the response. The actor runtime
+	// (de)serializes the request and response with the same per-type codec, so
+	// the request content-type describes the response payload too. daprd passes
+	// this back to the original caller verbatim; leaving it unset when the
+	// caller sent none mirrors the HTTP actor callback, which sets no explicit
+	// response content-type either.
+	var metadata map[string]string
+	if ct := contentTypeFromMetadata(req.GetMetadata()); ct != "" {
+		metadata = map[string]string{contentTypeMetadataKey: ct}
+	}
+
 	s.send(&pb.SubscribeActorEventsRequestAlpha1{
 		RequestType: &pb.SubscribeActorEventsRequestAlpha1_InvokeResponse{
 			InvokeResponse: &pb.SubscribeActorEventsRequestInvokeResponseAlpha1{
 				Id:       req.GetId(),
 				Data:     data,
-				Metadata: map[string]string{contentTypeMetadataKey: actorEventsContentType},
+				Metadata: metadata,
 			},
 		},
 	})
+}
+
+// contentTypeFromMetadata returns the content-type entry from actor callback
+// metadata, matching the key case-insensitively.
+func contentTypeFromMetadata(md map[string]string) string {
+	for k, v := range md {
+		if strings.EqualFold(k, contentTypeMetadataKey) {
+			return v
+		}
+	}
+	return ""
 }
 
 func (s *actorEventSubscription) handleReminder(req *pb.SubscribeActorEventsResponseReminderRequestAlpha1) {

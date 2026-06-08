@@ -159,6 +159,43 @@ func TestSubscribeActorEventsInvoke(t *testing.T) {
 		assert.Equal(t, "reentrancy-id-1", id)
 	})
 
+	t.Run("response echoes a non-json content-type", func(t *testing.T) {
+		// The content-type must reflect the caller's, not a hardcoded JSON:
+		// the actor runtime supports non-JSON serializers.
+		session.push(t, &pb.SubscribeActorEventsResponseAlpha1{
+			ResponseType: &pb.SubscribeActorEventsResponseAlpha1_InvokeRequest{
+				InvokeRequest: &pb.SubscribeActorEventsResponseInvokeRequestAlpha1{
+					Id:        "ct",
+					ActorType: "testActorType",
+					ActorId:   "myactor",
+					Method:    "GetUser",
+					Metadata:  map[string]string{"content-type": "application/x-yaml"},
+				},
+			},
+		})
+
+		resp := recvWithTimeout(t, session.responses)
+		require.NotNil(t, resp.GetInvokeResponse())
+		assert.Equal(t, "application/x-yaml", resp.GetInvokeResponse().GetMetadata()["content-type"])
+	})
+
+	t.Run("response omits content-type when the caller sent none", func(t *testing.T) {
+		session.push(t, &pb.SubscribeActorEventsResponseAlpha1{
+			ResponseType: &pb.SubscribeActorEventsResponseAlpha1_InvokeRequest{
+				InvokeRequest: &pb.SubscribeActorEventsResponseInvokeRequestAlpha1{
+					Id:        "no-ct",
+					ActorType: "testActorType",
+					ActorId:   "myactor",
+					Method:    "GetUser",
+				},
+			},
+		})
+
+		resp := recvWithTimeout(t, session.responses)
+		require.NotNil(t, resp.GetInvokeResponse())
+		assert.Empty(t, resp.GetInvokeResponse().GetMetadata())
+	})
+
 	t.Run("method not found", func(t *testing.T) {
 		handler.setInvokeErr(actorErr.ErrActorMethodNoFound)
 

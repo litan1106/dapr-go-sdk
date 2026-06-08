@@ -184,11 +184,9 @@ func main() {
 }
 
 func subscribeWithRetry(ctx context.Context, client dapr.Client, rt *runtime.ActorRunTimeContext) (func() error, error) {
-	var (
-		stop func() error
-		err  error
-	)
+	var err error
 	for i := 0; i < 30; i++ {
+		var stop func() error
 		stop, err = client.SubscribeActorEvents(ctx, rt, dapr.ActorEventSubscriptionOptions{
 			ActorIdleTimeout: time.Hour,
 		})
@@ -196,7 +194,12 @@ func subscribeWithRetry(ctx context.Context, client dapr.Client, rt *runtime.Act
 			return stop, nil
 		}
 		logger.Printf("actor event subscription not ready, retrying: %v", err)
-		time.Sleep(time.Second)
+		// Stop retrying promptly if the caller cancels (e.g. shutdown).
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(time.Second):
+		}
 	}
 	return nil, err
 }
