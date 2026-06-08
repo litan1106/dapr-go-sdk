@@ -66,6 +66,13 @@ func (c *GRPCClient) InvokeActor(ctx context.Context, in *InvokeActorRequest) (o
 		Data:      in.Data,
 	}
 
+	// Propagate the reentrancy id when invoking from within an actor callback
+	// received over the actor event stream, so reentrant calls share the
+	// caller's reentrancy stack.
+	if id, ok := reentrancyIDFromContext(ctx); ok {
+		req.Metadata = map[string]string{reentrancyIDMetadataKey: id}
+	}
+
 	resp, err := c.protoClient.InvokeActor(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("error invoking binding %s/%s: %w", in.ActorType, in.ActorID, err)

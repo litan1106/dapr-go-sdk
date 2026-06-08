@@ -1,0 +1,549 @@
+/*
+Copyright 2026 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package client
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
+
+	pb "github.com/dapr/dapr/pkg/proto/runtime/v1"
+	actorErr "github.com/dapr/go-sdk/actor/error"
+)
+
+const (
+	// reentrancyIDMetadataKey is the metadata key under which daprd sends the
+	// reentrancy id on actor invoke callbacks. It is propagated back on
+	// outbound actor invocations performed from within the callback context.
+	reentrancyIDMetadataKey = "Dapr-Reentrancy-Id"
+
+	// contentTypeMetadataKey carries the payload content type on actor
+	// invoke callbacks and responses.
+	contentTypeMetadataKey = "content-type"
+
+	// actorEventsContentType is the content type of actor method responses.
+	// Actor payloads are serialized with the actor runtime codec, which is
+	// JSON by default.
+	actorEventsContentType = "application/json"
+
+	actorEventsReconnectInitialBackoff = 200 * time.Millisecond
+	actorEventsReconnectMaxBackoff     = 5 * time.Second
+)
+
+// ActorEventHandler dispatches actor callbacks received over the actor event
+// stream to the hosted actor implementations.
+// *actor/runtime.ActorRunTimeContext satisfies this interface.
+type ActorEventHandler interface {
+	// RegisteredActorTypes returns the actor types hosted by this handler.
+	RegisteredActorTypes() []string
+	// InvokeActorMethod invokes an actor method and returns the serialized
+	// response payload.
+	InvokeActorMethod(ctx context.Context, actorType, actorID, method string, payload []byte) ([]byte, actorErr.ActorErr)
+	// InvokeReminder invokes a reminder on an actor. params is the JSON
+	// serialized api.ActorReminderParams.
+	InvokeReminder(ctx context.Context, actorType, actorID, reminderName string, params []byte) actorErr.ActorErr
+	// InvokeTimer invokes a timer on an actor. params is the JSON serialized
+	// api.ActorTimerParam.
+	InvokeTimer(ctx context.Context, actorType, actorID, timerName string, params []byte) actorErr.ActorErr
+	// Deactivate deactivates an actor instance.
+	Deactivate(ctx context.Context, actorType, actorID string) actorErr.ActorErr
+}
+
+// ActorReentrancyConfig configures actor reentrancy for the registered actor
+// types. A nil MaxStackDepth means Dapr's default is used.
+type ActorReentrancyConfig struct {
+	Enabled       bool
+	MaxStackDepth *int32
+}
+
+// ActorEntityConfig overrides the default actor configuration for a subset of
+// the registered actor types. Zero values mean the defaults from
+// ActorEventSubscriptionOptions (or Dapr's own defaults) apply.
+type ActorEntityConfig struct {
+	Entities                []string
+	ActorIdleTimeout        time.Duration
+	DrainOngoingCallTimeout time.Duration
+	DrainRebalancedActors   *bool
+	Reentrancy              *ActorReentrancyConfig
+}
+
+// ActorEventSubscriptionOptions configures the actor registration sent to the
+// Dapr sidecar when subscribing to actor events. Zero values mean Dapr's
+// defaults are used.
+type ActorEventSubscriptionOptions struct {
+	// ActorIdleTimeout is the time an actor can stay idle before it is
+	// deactivated.
+	ActorIdleTimeout time.Duration
+	// DrainOngoingCallTimeout is how long Dapr waits for ongoing actor calls
+	// to complete when draining rebalanced actors.
+	DrainOngoingCallTimeout time.Duration
+	// DrainRebalancedActors enables draining of actors that are rebalanced to
+	// another host. A nil value means Dapr's default is used.
+	DrainRebalancedActors *bool
+	// Reentrancy configures actor reentrancy for the registered actor types.
+	Reentrancy *ActorReentrancyConfig
+	// EntitiesConfig overrides the defaults above for specific actor types.
+	EntitiesConfig []ActorEntityConfig
+}
+
+// actorEventSubscription hosts actor types over the app-initiated
+// SubscribeActorEventsAlpha1 stream, dispatching callbacks pushed by the
+// sidecar to the ActorEventHandler and sending the correlated responses back.
+type actorEventSubscription struct {
+	ctx     context.Context
+	handler ActorEventHandler
+
+	// lock locks concurrent writes to the subscription stream.
+	lock   sync.Mutex
+	stream pb.Dapr_SubscribeActorEventsAlpha1Client
+	closed atomic.Bool
+
+	createStream func(ctx context.Context) (pb.Dapr_SubscribeActorEventsAlpha1Client, error)
+}
+
+// SubscribeActorEvents registers the handler's actor types with the Dapr
+// sidecar and hosts them over a bidirectional event stream: actor method
+// invocations, reminders, timers, and deactivations are delivered through the
+// stream, so the application does not need to expose a server port for actor
+// callbacks. The stream automatically reconnects and re-registers on
+// transient failures.
+//
+// Hosting stops when the returned stop function is called or ctx is
+// cancelled. Actor types must be registered on the handler (e.g. with
+// runtime.ActorRunTimeContext.RegisterActorFactory) before subscribing.
+//
+// This API is currently in Alpha.
+func (c *GRPCClient) SubscribeActorEvents(ctx context.Context, handler ActorEventHandler, opts ActorEventSubscriptionOptions) (func() error, error) {
+	if handler == nil {
+		return nil, errors.New("actor event handler required")
+	}
+	if len(handler.RegisteredActorTypes()) == 0 {
+		return nil, errors.New("actor event handler has no registered actor types")
+	}
+
+	createStream := func(ctx context.Context) (pb.Dapr_SubscribeActorEventsAlpha1Client, error) {
+		// Resolve the actor types on every (re)connect so types registered
+		// after a disconnect are picked up on re-registration.
+		return c.subscribeActorEventsInitialRequest(ctx, handler.RegisteredActorTypes(), opts)
+	}
+
+	stream, err := createStream(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	s := &actorEventSubscription{
+		ctx:          ctx,
+		handler:      handler,
+		stream:       stream,
+		createStream: createStream,
+	}
+
+	go s.run()
+
+	return s.Close, nil
+}
+
+// subscribeActorEventsInitialRequest opens the actor events stream, sends the
+// initial registration message and waits for the registration ack.
+func (c *GRPCClient) subscribeActorEventsInitialRequest(ctx context.Context, entities []string, opts ActorEventSubscriptionOptions) (pb.Dapr_SubscribeActorEventsAlpha1Client, error) {
+	stream, err := c.protoClient.SubscribeActorEventsAlpha1(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	err = stream.Send(&pb.SubscribeActorEventsRequestAlpha1{
+		RequestType: &pb.SubscribeActorEventsRequestAlpha1_InitialRequest{
+			InitialRequest: actorEventsInitialRequest(entities, opts),
+		},
+	})
+	if err != nil {
+		return nil, errors.Join(err, stream.CloseSend())
+	}
+
+	resp, err := stream.Recv()
+	if err != nil {
+		return nil, errors.Join(err, stream.CloseSend())
+	}
+
+	if resp.GetInitialResponse() == nil {
+		return nil, fmt.Errorf("unexpected initial response from server: %v", resp)
+	}
+
+	return stream, nil
+}
+
+// actorEventsInitialRequest maps the registered actor types and subscription
+// options to the wire-level registration message. Unset options are left nil
+// so Dapr applies its own defaults.
+func actorEventsInitialRequest(entities []string, opts ActorEventSubscriptionOptions) *pb.SubscribeActorEventsRequestInitialAlpha1 {
+	req := &pb.SubscribeActorEventsRequestInitialAlpha1{
+		Entities:                entities,
+		ActorIdleTimeout:        optionalDuration(opts.ActorIdleTimeout),
+		DrainOngoingCallTimeout: optionalDuration(opts.DrainOngoingCallTimeout),
+		DrainRebalancedActors:   opts.DrainRebalancedActors,
+		Reentrancy:              opts.Reentrancy.proto(),
+	}
+	for _, ec := range opts.EntitiesConfig {
+		req.EntitiesConfig = append(req.EntitiesConfig, &pb.ActorEntityConfig{
+			Entities:                ec.Entities,
+			ActorIdleTimeout:        optionalDuration(ec.ActorIdleTimeout),
+			DrainOngoingCallTimeout: optionalDuration(ec.DrainOngoingCallTimeout),
+			DrainRebalancedActors:   ec.DrainRebalancedActors,
+			Reentrancy:              ec.Reentrancy.proto(),
+		})
+	}
+	return req
+}
+
+func (r *ActorReentrancyConfig) proto() *pb.ActorReentrancyConfig {
+	if r == nil {
+		return nil
+	}
+	return &pb.ActorReentrancyConfig{
+		Enabled:       r.Enabled,
+		MaxStackDepth: r.MaxStackDepth,
+	}
+}
+
+func optionalDuration(d time.Duration) *durationpb.Duration {
+	if d == 0 {
+		return nil
+	}
+	return durationpb.New(d)
+}
+
+// Close stops hosting actor events and closes the stream.
+func (s *actorEventSubscription) Close() error {
+	if !s.closed.CompareAndSwap(false, true) {
+		return errors.New("actor event subscription already closed")
+	}
+
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	if s.stream != nil {
+		return s.stream.CloseSend()
+	}
+	return nil
+}
+
+// run reads callbacks from the stream and dispatches each on its own
+// goroutine so the read loop keeps draining. On a transient stream error it
+// reconnects with a backoff, re-sending the initial registration.
+func (s *actorEventSubscription) run() {
+	for {
+		msg, err := s.stream.Recv()
+		if err != nil {
+			if s.closed.Load() || s.ctx.Err() != nil {
+				return
+			}
+
+			if st, ok := status.FromError(err); ok && st.Code() == codes.Canceled {
+				return
+			}
+
+			logger.Printf("Error receiving actor events, reconnecting: %v", err)
+			if !s.reconnect() {
+				return
+			}
+			continue
+		}
+
+		go s.dispatch(msg)
+	}
+}
+
+// reconnect re-establishes the actor events stream with an exponential
+// backoff, returning false when the subscription is closed or its context is
+// cancelled.
+func (s *actorEventSubscription) reconnect() bool {
+	backoff := actorEventsReconnectInitialBackoff
+	for {
+		select {
+		case <-s.ctx.Done():
+			return false
+		case <-time.After(backoff):
+		}
+		if s.closed.Load() {
+			return false
+		}
+
+		newStream, err := s.createStream(s.ctx)
+		if err != nil {
+			logger.Printf("Error reconnecting actor events stream, retrying in %s: %v", backoff, err)
+			backoff = min(backoff*2, actorEventsReconnectMaxBackoff)
+			continue
+		}
+
+		s.lock.Lock()
+		s.stream = newStream
+		s.lock.Unlock()
+
+		return true
+	}
+}
+
+// dispatch routes a single callback pushed by the sidecar to the handler and
+// sends the correlated response, echoing the request id.
+func (s *actorEventSubscription) dispatch(msg *pb.SubscribeActorEventsResponseAlpha1) {
+	switch t := msg.GetResponseType().(type) {
+	case *pb.SubscribeActorEventsResponseAlpha1_InvokeRequest:
+		s.handleInvoke(t.InvokeRequest)
+	case *pb.SubscribeActorEventsResponseAlpha1_ReminderRequest:
+		s.handleReminder(t.ReminderRequest)
+	case *pb.SubscribeActorEventsResponseAlpha1_TimerRequest:
+		s.handleTimer(t.TimerRequest)
+	case *pb.SubscribeActorEventsResponseAlpha1_DeactivateRequest:
+		s.handleDeactivate(t.DeactivateRequest)
+	default:
+		logger.Printf("Unexpected actor event message type: %T", t)
+	}
+}
+
+func (s *actorEventSubscription) handleInvoke(req *pb.SubscribeActorEventsResponseInvokeRequestAlpha1) {
+	// Make the callback metadata (content-type, Dapr-Reentrancy-Id, ...)
+	// available to the actor code: InvokeActor propagates the reentrancy id
+	// from this context on outbound actor invocations.
+	ctx := withActorCallbackMetadata(s.ctx, req.GetMetadata())
+
+	data, aerr := s.handler.InvokeActorMethod(ctx, req.GetActorType(), req.GetActorId(), req.GetMethod(), req.GetData())
+	if aerr != actorErr.Success {
+		s.sendRequestFailed(req.GetId(), aerr)
+		return
+	}
+
+	s.send(&pb.SubscribeActorEventsRequestAlpha1{
+		RequestType: &pb.SubscribeActorEventsRequestAlpha1_InvokeResponse{
+			InvokeResponse: &pb.SubscribeActorEventsRequestInvokeResponseAlpha1{
+				Id:       req.GetId(),
+				Data:     data,
+				Metadata: map[string]string{contentTypeMetadataKey: actorEventsContentType},
+			},
+		},
+	})
+}
+
+func (s *actorEventSubscription) handleReminder(req *pb.SubscribeActorEventsResponseReminderRequestAlpha1) {
+	// Build the same JSON shape the sidecar sends on the HTTP reminder
+	// callback, which api.ActorReminderParams unmarshals: data carries the
+	// JSON representation of the registered payload verbatim.
+	params, err := json.Marshal(&struct {
+		Data    json.RawMessage `json:"data,omitempty"`
+		DueTime string          `json:"dueTime"`
+		Period  string          `json:"period"`
+	}{
+		Data:    anyToRawData(req.GetData()),
+		DueTime: req.GetDueTime(),
+		Period:  req.GetPeriod(),
+	})
+	if err != nil {
+		s.sendRequestFailed(req.GetId(), actorErr.ErrRemindersParamsInvalid)
+		return
+	}
+
+	aerr := s.handler.InvokeReminder(s.ctx, req.GetActorType(), req.GetActorId(), req.GetName(), params)
+	if aerr != actorErr.Success {
+		s.sendRequestFailed(req.GetId(), aerr)
+		return
+	}
+
+	s.send(&pb.SubscribeActorEventsRequestAlpha1{
+		RequestType: &pb.SubscribeActorEventsRequestAlpha1_ReminderResponse{
+			ReminderResponse: &pb.SubscribeActorEventsRequestReminderResponseAlpha1{Id: req.GetId()},
+		},
+	})
+}
+
+func (s *actorEventSubscription) handleTimer(req *pb.SubscribeActorEventsResponseTimerRequestAlpha1) {
+	// Build the same JSON shape the sidecar sends on the HTTP timer callback,
+	// which api.ActorTimerParam unmarshals: data carries the JSON
+	// representation of the registered payload verbatim.
+	params, err := json.Marshal(&struct {
+		Callback string          `json:"callback"`
+		Data     json.RawMessage `json:"data,omitempty"`
+		DueTime  string          `json:"dueTime"`
+		Period   string          `json:"period"`
+	}{
+		Callback: req.GetCallback(),
+		Data:     anyToRawData(req.GetData()),
+		DueTime:  req.GetDueTime(),
+		Period:   req.GetPeriod(),
+	})
+	if err != nil {
+		s.sendRequestFailed(req.GetId(), actorErr.ErrTimerParamsInvalid)
+		return
+	}
+
+	aerr := s.handler.InvokeTimer(s.ctx, req.GetActorType(), req.GetActorId(), req.GetName(), params)
+	if aerr != actorErr.Success {
+		s.sendRequestFailed(req.GetId(), aerr)
+		return
+	}
+
+	s.send(&pb.SubscribeActorEventsRequestAlpha1{
+		RequestType: &pb.SubscribeActorEventsRequestAlpha1_TimerResponse{
+			TimerResponse: &pb.SubscribeActorEventsRequestReminderResponseAlpha1{Id: req.GetId()},
+		},
+	})
+}
+
+func (s *actorEventSubscription) handleDeactivate(req *pb.SubscribeActorEventsResponseDeactivateRequestAlpha1) {
+	aerr := s.handler.Deactivate(s.ctx, req.GetActorType(), req.GetActorId())
+	if aerr != actorErr.Success {
+		s.sendRequestFailed(req.GetId(), aerr)
+		return
+	}
+
+	s.send(&pb.SubscribeActorEventsRequestAlpha1{
+		RequestType: &pb.SubscribeActorEventsRequestAlpha1_DeactivateResponse{
+			DeactivateResponse: &pb.SubscribeActorEventsRequestDeactivateResponseAlpha1{Id: req.GetId()},
+		},
+	})
+}
+
+// sendRequestFailed reports a callback the handler could not process. The
+// gRPC status code matters to the sidecar: NotFound marks the failure as
+// permanent (non-retryable), e.g. an unknown actor type or method.
+func (s *actorEventSubscription) sendRequestFailed(id string, aerr actorErr.ActorErr) {
+	s.send(&pb.SubscribeActorEventsRequestAlpha1{
+		RequestType: &pb.SubscribeActorEventsRequestAlpha1_RequestFailed{
+			RequestFailed: &pb.SubscribeActorEventsRequestFailedAlpha1{
+				Id:      id,
+				Code:    uint32(actorErrToStatusCode(aerr)),
+				Message: actorErrMessage(aerr),
+			},
+		},
+	})
+}
+
+// send serializes writes to the stream: gRPC forbids concurrent Send calls
+// on a single stream and callbacks are dispatched on separate goroutines.
+func (s *actorEventSubscription) send(msg *pb.SubscribeActorEventsRequestAlpha1) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	if err := s.stream.Send(msg); err != nil && !s.closed.Load() {
+		// The response cannot be delivered (e.g. the stream dropped after the
+		// callback was dispatched); the sidecar fails the pending request on
+		// its side when the stream breaks.
+		logger.Printf("Error sending actor event response: %v", err)
+	}
+}
+
+// actorErrToStatusCode maps actor runtime errors to the gRPC status codes
+// reported on request_failed messages. The mapping mirrors the HTTP actor
+// service, where *NotFound errors map to 404 and the rest to 500.
+func actorErrToStatusCode(aerr actorErr.ActorErr) codes.Code {
+	switch aerr {
+	case actorErr.ErrActorTypeNotFound,
+		actorErr.ErrActorMethodNoFound,
+		actorErr.ErrActorIDNotFound,
+		actorErr.ErrReminderFuncUndefined:
+		return codes.NotFound
+	case actorErr.ErrRemindersParamsInvalid,
+		actorErr.ErrTimerParamsInvalid:
+		return codes.InvalidArgument
+	default:
+		return codes.Internal
+	}
+}
+
+func actorErrMessage(aerr actorErr.ActorErr) string {
+	switch aerr {
+	case actorErr.ErrActorTypeNotFound:
+		return "actor type not found"
+	case actorErr.ErrActorMethodNoFound:
+		return "actor method not found"
+	case actorErr.ErrActorIDNotFound:
+		return "actor id not found"
+	case actorErr.ErrReminderFuncUndefined:
+		return "actor does not implement reminder callbacks"
+	case actorErr.ErrRemindersParamsInvalid:
+		return "invalid reminder parameters"
+	case actorErr.ErrTimerParamsInvalid:
+		return "invalid timer parameters"
+	case actorErr.ErrActorMethodSerializeFailed:
+		return "failed to serialize actor method payload"
+	case actorErr.ErrActorInvokeFailed:
+		return "actor method invocation failed"
+	case actorErr.ErrActorFactoryNotSet:
+		return "actor factory not set"
+	case actorErr.ErrSaveStateFailed:
+		return "failed to save actor state"
+	default:
+		return fmt.Sprintf("actor error %d", aerr)
+	}
+}
+
+// anyToRawData unwraps the reminder/timer payload the sidecar sends as a
+// google.protobuf.Any. Payloads registered as raw bytes (the common case)
+// arrive as a wrapped BytesValue; typed payloads are rendered as JSON. This
+// mirrors how the sidecar serializes reminder data for the HTTP callbacks.
+func anyToRawData(data *anypb.Any) []byte {
+	if data == nil {
+		return nil
+	}
+	msg, err := data.UnmarshalNew()
+	if err != nil {
+		// Unknown or unregistered payload type: fall back to the raw value.
+		return data.GetValue()
+	}
+	if b, ok := msg.(*wrapperspb.BytesValue); ok {
+		return b.GetValue()
+	}
+	d, err := protojson.Marshal(msg)
+	if err != nil {
+		return data.GetValue()
+	}
+	return d
+}
+
+// actorCallbackMetadataCtxKey carries the metadata of the actor callback
+// being processed on the context handed to actor code.
+type actorCallbackMetadataCtxKey struct{}
+
+func withActorCallbackMetadata(ctx context.Context, md map[string]string) context.Context {
+	if len(md) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, actorCallbackMetadataCtxKey{}, md)
+}
+
+// reentrancyIDFromContext returns the reentrancy id of the actor callback in
+// flight on this context, if any.
+func reentrancyIDFromContext(ctx context.Context) (string, bool) {
+	md, ok := ctx.Value(actorCallbackMetadataCtxKey{}).(map[string]string)
+	if !ok {
+		return "", false
+	}
+	for k, v := range md {
+		if strings.EqualFold(k, reentrancyIDMetadataKey) && v != "" {
+			return v, true
+		}
+	}
+	return "", false
+}
