@@ -185,7 +185,10 @@ func (c *GRPCClient) subscribeActorEventsInitialRequest(ctx context.Context, ent
 	}
 
 	if resp.GetInitialResponse() == nil {
-		return nil, fmt.Errorf("unexpected initial response from server: %v", resp)
+		return nil, errors.Join(
+			fmt.Errorf("unexpected initial response from server: %v", resp),
+			stream.CloseSend(),
+		)
 	}
 
 	return stream, nil
@@ -251,7 +254,13 @@ func (s *actorEventSubscription) Close() error {
 // reconnects with a backoff, re-sending the initial registration.
 func (s *actorEventSubscription) run() {
 	for {
-		msg, err := s.stream.Recv()
+		// Snapshot the current stream under the lock; reconnect may replace it
+		// concurrently with the send goroutines below.
+		s.lock.Lock()
+		stream := s.stream
+		s.lock.Unlock()
+
+		msg, err := stream.Recv()
 		if err != nil {
 			if s.closed.Load() || s.ctx.Err() != nil {
 				return
@@ -268,7 +277,10 @@ func (s *actorEventSubscription) run() {
 			continue
 		}
 
-		go s.dispatch(msg)
+		// Dispatch on the stream that delivered the message so the response is
+		// sent back on the same stream, keeping request ids correlated even if
+		// a reconnect swaps the stream while the handler runs.
+		go s.dispatch(stream, msg)
 	}
 }
 
@@ -303,23 +315,23 @@ func (s *actorEventSubscription) reconnect() bool {
 }
 
 // dispatch routes a single callback pushed by the sidecar to the handler and
-// sends the correlated response, echoing the request id.
-func (s *actorEventSubscription) dispatch(msg *pb.SubscribeActorEventsResponseAlpha1) {
+// sends the correlated response on stream, echoing the request id.
+func (s *actorEventSubscription) dispatch(stream pb.Dapr_SubscribeActorEventsAlpha1Client, msg *pb.SubscribeActorEventsResponseAlpha1) {
 	switch t := msg.GetResponseType().(type) {
 	case *pb.SubscribeActorEventsResponseAlpha1_InvokeRequest:
-		s.handleInvoke(t.InvokeRequest)
+		s.handleInvoke(stream, t.InvokeRequest)
 	case *pb.SubscribeActorEventsResponseAlpha1_ReminderRequest:
-		s.handleReminder(t.ReminderRequest)
+		s.handleReminder(stream, t.ReminderRequest)
 	case *pb.SubscribeActorEventsResponseAlpha1_TimerRequest:
-		s.handleTimer(t.TimerRequest)
+		s.handleTimer(stream, t.TimerRequest)
 	case *pb.SubscribeActorEventsResponseAlpha1_DeactivateRequest:
-		s.handleDeactivate(t.DeactivateRequest)
+		s.handleDeactivate(stream, t.DeactivateRequest)
 	default:
 		logger.Printf("Unexpected actor event message type: %T", t)
 	}
 }
 
-func (s *actorEventSubscription) handleInvoke(req *pb.SubscribeActorEventsResponseInvokeRequestAlpha1) {
+func (s *actorEventSubscription) handleInvoke(stream pb.Dapr_SubscribeActorEventsAlpha1Client, req *pb.SubscribeActorEventsResponseInvokeRequestAlpha1) {
 	// Make the callback metadata (content-type, Dapr-Reentrancy-Id, ...)
 	// available to the actor code: InvokeActor propagates the reentrancy id
 	// from this context on outbound actor invocations.
@@ -327,7 +339,7 @@ func (s *actorEventSubscription) handleInvoke(req *pb.SubscribeActorEventsRespon
 
 	data, aerr := s.handler.InvokeActorMethod(ctx, req.GetActorType(), req.GetActorId(), req.GetMethod(), req.GetData())
 	if aerr != actorErr.Success {
-		s.sendRequestFailed(req.GetId(), aerr)
+		s.sendRequestFailed(stream, req.GetId(), aerr)
 		return
 	}
 
@@ -342,7 +354,7 @@ func (s *actorEventSubscription) handleInvoke(req *pb.SubscribeActorEventsRespon
 		metadata = map[string]string{contentTypeMetadataKey: ct}
 	}
 
-	s.send(&pb.SubscribeActorEventsRequestAlpha1{
+	s.send(stream, &pb.SubscribeActorEventsRequestAlpha1{
 		RequestType: &pb.SubscribeActorEventsRequestAlpha1_InvokeResponse{
 			InvokeResponse: &pb.SubscribeActorEventsRequestInvokeResponseAlpha1{
 				Id:       req.GetId(),
@@ -364,7 +376,7 @@ func contentTypeFromMetadata(md map[string]string) string {
 	return ""
 }
 
-func (s *actorEventSubscription) handleReminder(req *pb.SubscribeActorEventsResponseReminderRequestAlpha1) {
+func (s *actorEventSubscription) handleReminder(stream pb.Dapr_SubscribeActorEventsAlpha1Client, req *pb.SubscribeActorEventsResponseReminderRequestAlpha1) {
 	// Build the same JSON shape the sidecar sends on the HTTP reminder
 	// callback, which api.ActorReminderParams unmarshals: data carries the
 	// JSON representation of the registered payload verbatim.
@@ -378,24 +390,24 @@ func (s *actorEventSubscription) handleReminder(req *pb.SubscribeActorEventsResp
 		Period:  req.GetPeriod(),
 	})
 	if err != nil {
-		s.sendRequestFailed(req.GetId(), actorErr.ErrRemindersParamsInvalid)
+		s.sendRequestFailed(stream, req.GetId(), actorErr.ErrRemindersParamsInvalid)
 		return
 	}
 
 	aerr := s.handler.InvokeReminder(s.ctx, req.GetActorType(), req.GetActorId(), req.GetName(), params)
 	if aerr != actorErr.Success {
-		s.sendRequestFailed(req.GetId(), aerr)
+		s.sendRequestFailed(stream, req.GetId(), aerr)
 		return
 	}
 
-	s.send(&pb.SubscribeActorEventsRequestAlpha1{
+	s.send(stream, &pb.SubscribeActorEventsRequestAlpha1{
 		RequestType: &pb.SubscribeActorEventsRequestAlpha1_ReminderResponse{
 			ReminderResponse: &pb.SubscribeActorEventsRequestReminderResponseAlpha1{Id: req.GetId()},
 		},
 	})
 }
 
-func (s *actorEventSubscription) handleTimer(req *pb.SubscribeActorEventsResponseTimerRequestAlpha1) {
+func (s *actorEventSubscription) handleTimer(stream pb.Dapr_SubscribeActorEventsAlpha1Client, req *pb.SubscribeActorEventsResponseTimerRequestAlpha1) {
 	// Build the same JSON shape the sidecar sends on the HTTP timer callback,
 	// which api.ActorTimerParam unmarshals: data carries the JSON
 	// representation of the registered payload verbatim.
@@ -411,31 +423,31 @@ func (s *actorEventSubscription) handleTimer(req *pb.SubscribeActorEventsRespons
 		Period:   req.GetPeriod(),
 	})
 	if err != nil {
-		s.sendRequestFailed(req.GetId(), actorErr.ErrTimerParamsInvalid)
+		s.sendRequestFailed(stream, req.GetId(), actorErr.ErrTimerParamsInvalid)
 		return
 	}
 
 	aerr := s.handler.InvokeTimer(s.ctx, req.GetActorType(), req.GetActorId(), req.GetName(), params)
 	if aerr != actorErr.Success {
-		s.sendRequestFailed(req.GetId(), aerr)
+		s.sendRequestFailed(stream, req.GetId(), aerr)
 		return
 	}
 
-	s.send(&pb.SubscribeActorEventsRequestAlpha1{
+	s.send(stream, &pb.SubscribeActorEventsRequestAlpha1{
 		RequestType: &pb.SubscribeActorEventsRequestAlpha1_TimerResponse{
 			TimerResponse: &pb.SubscribeActorEventsRequestReminderResponseAlpha1{Id: req.GetId()},
 		},
 	})
 }
 
-func (s *actorEventSubscription) handleDeactivate(req *pb.SubscribeActorEventsResponseDeactivateRequestAlpha1) {
+func (s *actorEventSubscription) handleDeactivate(stream pb.Dapr_SubscribeActorEventsAlpha1Client, req *pb.SubscribeActorEventsResponseDeactivateRequestAlpha1) {
 	aerr := s.handler.Deactivate(s.ctx, req.GetActorType(), req.GetActorId())
 	if aerr != actorErr.Success {
-		s.sendRequestFailed(req.GetId(), aerr)
+		s.sendRequestFailed(stream, req.GetId(), aerr)
 		return
 	}
 
-	s.send(&pb.SubscribeActorEventsRequestAlpha1{
+	s.send(stream, &pb.SubscribeActorEventsRequestAlpha1{
 		RequestType: &pb.SubscribeActorEventsRequestAlpha1_DeactivateResponse{
 			DeactivateResponse: &pb.SubscribeActorEventsRequestDeactivateResponseAlpha1{Id: req.GetId()},
 		},
@@ -445,8 +457,8 @@ func (s *actorEventSubscription) handleDeactivate(req *pb.SubscribeActorEventsRe
 // sendRequestFailed reports a callback the handler could not process. The
 // gRPC status code matters to the sidecar: NotFound marks the failure as
 // permanent (non-retryable), e.g. an unknown actor type or method.
-func (s *actorEventSubscription) sendRequestFailed(id string, aerr actorErr.ActorErr) {
-	s.send(&pb.SubscribeActorEventsRequestAlpha1{
+func (s *actorEventSubscription) sendRequestFailed(stream pb.Dapr_SubscribeActorEventsAlpha1Client, id string, aerr actorErr.ActorErr) {
+	s.send(stream, &pb.SubscribeActorEventsRequestAlpha1{
 		RequestType: &pb.SubscribeActorEventsRequestAlpha1_RequestFailed{
 			RequestFailed: &pb.SubscribeActorEventsRequestFailedAlpha1{
 				Id:      id,
@@ -459,11 +471,21 @@ func (s *actorEventSubscription) sendRequestFailed(id string, aerr actorErr.Acto
 
 // send serializes writes to the stream: gRPC forbids concurrent Send calls
 // on a single stream and callbacks are dispatched on separate goroutines.
-func (s *actorEventSubscription) send(msg *pb.SubscribeActorEventsRequestAlpha1) {
+// It writes to the specific stream that delivered the callback, dropping the
+// response if a reconnect has since replaced it.
+func (s *actorEventSubscription) send(stream pb.Dapr_SubscribeActorEventsAlpha1Client, msg *pb.SubscribeActorEventsRequestAlpha1) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
-	if err := s.stream.Send(msg); err != nil && !s.closed.Load() {
+	if s.stream != stream {
+		// A reconnect replaced the stream while this callback ran. The request
+		// id is meaningless on the new stream, and the sidecar already failed
+		// the in-flight request when the old stream dropped, so drop it.
+		logger.Printf("Dropping actor event response on a reconnected stream")
+		return
+	}
+
+	if err := stream.Send(msg); err != nil && !s.closed.Load() {
 		// The response cannot be delivered (e.g. the stream dropped after the
 		// callback was dispatched); the sidecar fails the pending request on
 		// its side when the stream breaks.

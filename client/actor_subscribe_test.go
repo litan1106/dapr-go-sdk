@@ -509,6 +509,75 @@ func TestSubscribeActorEventsReconnect(t *testing.T) {
 	assert.Equal(t, "1", resp.GetInvokeResponse().GetId())
 }
 
+// TestSubscribeActorEventsResponseDroppedAfterReconnect verifies that a
+// callback still running when the stream reconnects has its response dropped
+// rather than sent on the new stream, where the request id would not
+// correlate with any pending request.
+func TestSubscribeActorEventsResponseDroppedAfterReconnect(t *testing.T) {
+	srv, client := newTestActorEventsServer(t)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	handler := &testActorEventHandler{
+		actorTypes: []string{"testActorType"},
+		invokeFn: func(ctx context.Context, actorType, actorID, method string, payload []byte) ([]byte, actorErr.ActorErr) {
+			if method == "Blocking" {
+				close(entered)
+				<-release // hold the response until after the reconnect
+			}
+			return payload, actorErr.Success
+		},
+	}
+
+	stop, err := client.SubscribeActorEvents(t.Context(), handler, ActorEventSubscriptionOptions{})
+	require.NoError(t, err)
+	defer stop() //nolint:errcheck
+
+	recvWithTimeout(t, srv.initialRequests)
+	session := recvWithTimeout(t, srv.sessions)
+
+	// Deliver a callback that blocks inside the handler, capturing the
+	// original stream.
+	session.push(t, &pb.SubscribeActorEventsResponseAlpha1{
+		ResponseType: &pb.SubscribeActorEventsResponseAlpha1_InvokeRequest{
+			InvokeRequest: &pb.SubscribeActorEventsResponseInvokeRequestAlpha1{
+				Id: "stale", ActorType: "testActorType", ActorId: "myactor", Method: "Blocking",
+			},
+		},
+	})
+	<-entered
+
+	// Reconnect while the handler is still running.
+	session.kill(status.Error(codes.Unavailable, "sidecar restarting"))
+	recvWithTimeout(t, srv.initialRequests)
+	newSession := recvWithTimeout(t, srv.sessions)
+
+	// Let the stale handler finish: its response targets the old stream and
+	// must be dropped, never reaching the new stream.
+	close(release)
+
+	// A fresh callback on the new stream still works.
+	newSession.push(t, &pb.SubscribeActorEventsResponseAlpha1{
+		ResponseType: &pb.SubscribeActorEventsResponseAlpha1_InvokeRequest{
+			InvokeRequest: &pb.SubscribeActorEventsResponseInvokeRequestAlpha1{
+				Id: "fresh", ActorType: "testActorType", ActorId: "myactor", Method: "Echo",
+			},
+		},
+	})
+
+	resp := recvWithTimeout(t, newSession.responses)
+	require.NotNil(t, resp.GetInvokeResponse())
+	assert.Equal(t, "fresh", resp.GetInvokeResponse().GetId(),
+		"the new stream must only receive the fresh response, not the stale one")
+
+	// No further (stale) response should arrive on the new stream.
+	select {
+	case extra := <-newSession.responses:
+		t.Fatalf("unexpected extra response on reconnected stream: %v", extra)
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
 func TestSubscribeActorEventsStop(t *testing.T) {
 	srv, client := newTestActorEventsServer(t)
 
