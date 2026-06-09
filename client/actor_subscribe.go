@@ -32,6 +32,7 @@ import (
 
 	pb "github.com/dapr/dapr/pkg/proto/runtime/v1"
 	actorErr "github.com/dapr/go-sdk/actor/error"
+	"github.com/dapr/kit/events/loop"
 )
 
 const (
@@ -46,7 +47,28 @@ const (
 
 	actorEventsReconnectInitialBackoff = 200 * time.Millisecond
 	actorEventsReconnectMaxBackoff     = 5 * time.Second
+
+	// actorEventsSendBuffer is the per-segment capacity of the outbound send
+	// loop's queue. The queue grows by segments under burst, so this only sets
+	// how often that happens.
+	actorEventsSendBuffer = 64
 )
+
+// actorEventsSendLoopFactory builds the single-consumer loop that serializes
+// outbound writes to the stream. gRPC forbids concurrent Send on one stream;
+// running every write through one loop goroutine serializes them without
+// holding a lock across the (potentially blocking) Send. Mirrors the
+// loop-per-stream pattern daprd uses for its own actor streams.
+var actorEventsSendLoopFactory = loop.New[actorEventOutbound](actorEventsSendBuffer)
+
+// actorEventOutbound is a single write to perform on the actor event stream,
+// bound to the stream that produced the originating callback so a response
+// left over from a stream that has since reconnected can be dropped. A nil msg
+// is the loop's close sentinel.
+type actorEventOutbound struct {
+	stream pb.Dapr_SubscribeActorEventsAlpha1Client
+	msg    *pb.SubscribeActorEventsRequestAlpha1
+}
 
 // ActorEventHandler dispatches actor callbacks received over the actor event
 // stream to the hosted actor implementations.
@@ -115,7 +137,11 @@ type actorEventSubscription struct {
 
 	handler ActorEventHandler
 
-	// lock locks concurrent writes to the subscription stream.
+	// sendLoop serializes all writes to the stream on a single goroutine, so a
+	// blocking Send never stalls the read loop or the dispatch goroutines.
+	sendLoop loop.Interface[actorEventOutbound]
+
+	// lock guards the stream pointer, which reconnect replaces.
 	lock   sync.Mutex
 	stream pb.Dapr_SubscribeActorEventsAlpha1Client
 	closed atomic.Bool
@@ -166,7 +192,9 @@ func (c *GRPCClient) SubscribeActorEvents(ctx context.Context, handler ActorEven
 		stream:       stream,
 		createStream: createStream,
 	}
+	s.sendLoop = actorEventsSendLoopFactory.NewLoop(s)
 
+	go func() { _ = s.sendLoop.Run(streamCtx) }()
 	go s.run()
 
 	return s.Close, nil
@@ -244,33 +272,32 @@ func optionalDuration(d time.Duration) *durationpb.Duration {
 	return durationpb.New(d)
 }
 
-// Close stops hosting actor events and closes the stream.
+// Close stops hosting actor events. Cancelling the stream context tears down
+// the stream (unblocking a Recv in run() and any Send in the loop), then the
+// send loop is drained and stopped. No lock is taken, so a blocked Send cannot
+// deadlock shutdown.
 func (s *actorEventSubscription) Close() error {
 	if !s.closed.CompareAndSwap(false, true) {
 		return errors.New("actor event subscription already closed")
 	}
 
-	// Half-close the send side first, then cancel the stream context so a Recv
-	// blocked in run() unblocks promptly instead of waiting for the server to
-	// react to the half-close.
-	s.lock.Lock()
-	var err error
-	if s.stream != nil {
-		err = s.stream.CloseSend()
-	}
-	s.lock.Unlock()
-
 	s.cancel()
-	return err
+	s.sendLoop.Close(actorEventOutbound{})
+	return nil
 }
 
 // run reads callbacks from the stream and dispatches each on its own
 // goroutine so the read loop keeps draining. On a transient stream error it
 // reconnects with a backoff, re-sending the initial registration.
 func (s *actorEventSubscription) run() {
+	// Ensure the send loop is stopped when the reader exits, including when the
+	// caller cancels ctx without calling the returned stop func. Close is
+	// idempotent, so a concurrent stop() is harmless.
+	defer s.Close() //nolint:errcheck
+
 	for {
 		// Snapshot the current stream under the lock; reconnect may replace it
-		// concurrently with the send goroutines below.
+		// concurrently with the send loop.
 		s.lock.Lock()
 		stream := s.stream
 		s.lock.Unlock()
@@ -484,28 +511,42 @@ func (s *actorEventSubscription) sendRequestFailed(stream pb.Dapr_SubscribeActor
 	})
 }
 
-// send serializes writes to the stream: gRPC forbids concurrent Send calls
-// on a single stream and callbacks are dispatched on separate goroutines.
-// It writes to the specific stream that delivered the callback, dropping the
-// response if a reconnect has since replaced it.
+// send queues a write to the stream. Enqueue is non-blocking, so dispatch
+// goroutines never block here; the send loop performs the actual write.
 func (s *actorEventSubscription) send(stream pb.Dapr_SubscribeActorEventsAlpha1Client, msg *pb.SubscribeActorEventsRequestAlpha1) {
-	s.lock.Lock()
-	defer s.lock.Unlock()
+	s.sendLoop.Enqueue(actorEventOutbound{stream: stream, msg: msg})
+}
 
-	if s.stream != stream {
+// Handle performs one queued write on the send loop's single goroutine, which
+// serializes Send as gRPC requires without holding a lock across it. It writes
+// to the specific stream that delivered the callback, dropping the response if
+// a reconnect has since replaced the stream. A nil msg is the close sentinel.
+func (s *actorEventSubscription) Handle(_ context.Context, out actorEventOutbound) error {
+	if out.msg == nil {
+		return nil
+	}
+
+	s.lock.Lock()
+	current := s.stream
+	s.lock.Unlock()
+
+	if out.stream != current {
 		// A reconnect replaced the stream while this callback ran. The request
 		// id is meaningless on the new stream, and the sidecar already failed
 		// the in-flight request when the old stream dropped, so drop it.
 		logger.Printf("Dropping actor event response on a reconnected stream")
-		return
+		return nil
 	}
 
-	if err := stream.Send(msg); err != nil && !s.closed.Load() {
+	if err := out.stream.Send(out.msg); err != nil && !s.closed.Load() {
 		// The response cannot be delivered (e.g. the stream dropped after the
 		// callback was dispatched); the sidecar fails the pending request on
 		// its side when the stream breaks.
 		logger.Printf("Error sending actor event response: %v", err)
 	}
+	// Never return an error: that would stop the loop and abort all further
+	// writes for this subscription.
+	return nil
 }
 
 // actorErrToStatusCode maps actor runtime errors to the gRPC status codes
